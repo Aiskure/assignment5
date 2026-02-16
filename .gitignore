@@ -1,6 +1,5 @@
 *.bin
 models/
-data/
 
 # Experiment outputs
 wandb/
