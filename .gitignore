@@ -2,6 +2,12 @@
 models/
 data/
 
+# Experiment outputs
+wandb/
+sft_eval/
+cs336_alignment/sft_eval/
+sft_export_*/
+
 nav
 tags
 
