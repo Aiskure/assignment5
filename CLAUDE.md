@@ -16,7 +16,9 @@ This is **Stanford CS336 Spring 2025 Assignment 5: Alignment** - a publicly avai
 
 This project implements LLM alignment techniques (SFT, Expert Iteration, GRPO) using Qwen 2.5 Math 1.5B.
 
-**Important**: We use **GSM8K** instead of MATH as the training/evaluation dataset (MATH is not open-source).
+**Important dataset note**:
+- **Current working dataset (GRPO / EI)**: local **MATH-format** dataset at `data/math/*.jsonl`.
+- **GSM8K** is kept for baseline/SFT historical evaluation and comparison scripts.
 
 ## Repository Structure
 
@@ -50,21 +52,33 @@ assignment5/
 
 ## Key Information
 
-- **Model**: Qwen 2.5 Math 1.5B at `/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B`
-- **Dataset**: **GSM8K** (替代 MATH，因 MATH 不开源)
+- **Model**: Qwen 2.5 Math 1.5B (set via `ASSIGNMENT5_MODEL_ID`; AutoDL default: `/root/autodl-tmp/models/Qwen2.5-Math-1.5B`)
+- **Dataset**:
+  - `data/math/*.jsonl` for current GRPO train loop and EI experiments
+  - `data/gsm8k/*.jsonl` for baseline / SFT historical comparison runs
 - **Package manager**: `uv` (not pip)
 - **Python**: 3.11 or 3.12 (not 3.13)
+- **Current focus**: GRPO train loop + Expert Iteration on MATH-format data
 
-## Training Environment (NSCC)
+## Current Environment (AutoDL, 2026-02-20)
+
+- **平台**: AutoDL (中国)
+- **GPU**: 2x NVIDIA A800 80GB PCIe
+- **总显存**: 160GB
+- **CPU / RAM**: 28 cores / 200 GB
+- **项目路径**: `/root/assignment5`
+- **数据盘**: `/root/autodl-tmp`（模型与缓存放这里，避免系统盘占满）
+- **注意事项**:
+  - 推荐设置 `ASSIGNMENT5_MODEL_ID=/root/autodl-tmp/models/Qwen2.5-Math-1.5B`
+  - 推荐使用 `HF_HOME`，不再依赖 `TRANSFORMERS_CACHE`
+  - `flash-attn` 已在 CUDA 12.4 环境下编译通过（A800 架构 `sm80`）
+
+## Legacy Environment (NSCC, historical records)
 
 - **集群**: NSCC (National Supercomputing Centre Singapore)
 - **GPU**: 4x NVIDIA A100 40GB per job
 - **总显存**: 160GB per job
-- **注意事项**:
-  - A100 40GB 相比 H100 显存较小，需要注意 micro_batch_size 设置
-  - 4 卡并行时可用 `accelerate` 或 PyTorch DDP
-  - 建议 micro_batch_size=1~2 per GPU，用 gradient accumulation 凑大 batch
-  - vLLM 推理时可用 `tensor_parallel_size=4` 加速 rollout 生成
+- **说明**: 该环境用于历史实验记录，对当前 AutoDL 运行不再作为默认配置
 
 ## Development Workflow
 
@@ -156,22 +170,24 @@ All functions to implement are in `tests/adapters.py`. Each raises `NotImplement
 #SBATCH --time=04:00:00
 ```
 
-## Latest Evaluation Status (2026-02-14)
+## Latest Evaluation Status (2026-02-20, AutoDL)
 
-- **Current baseline evaluation** has completed on GSM8K test split using `cs336_alignment/math_baseline.py`.
+- **Current baseline evaluation** has completed on GSM8K test split using `cs336_alignment/math_baseline.py` in AutoDL.
 - **Result summary** (from `test_log.json`, n=1319):
   - accuracy: `0.0348749052` (~3.49%)
   - format_reward: `0.2934040940` (~29.34%)
   - type1/type2/type3: `46 / 341 / 932`
-- **Output file**: `/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B/test_log.json`
+- **Output file**: `/root/autodl-tmp/models/Qwen2.5-Math-1.5B/test_log.json`
 
 ## Evaluation Notes (Important)
 
 - Use this command in project root:
   - `uv run python -m cs336_alignment.math_baseline`
+- Set model path with environment variable:
+  - `export ASSIGNMENT5_MODEL_ID=/root/autodl-tmp/models/Qwen2.5-Math-1.5B`
 - Do **not** use `uv python cs336_alignment/math_baseline.py` (invalid `uv` subcommand usage).
 - `math_baseline.py` expects `data/gsm8k/test.jsonl` for evaluation input.
-- In NSCC PBS jobs, `CUDA_VISIBLE_DEVICES` may be UUID-based (`GPU-...`). The script has been updated to normalize UUIDs to device indices before creating vLLM `LLM(...)`.
+- In NSCC PBS jobs, `CUDA_VISIBLE_DEVICES` may be UUID-based (`GPU-...`). This is retained as legacy compatibility logic.
 - `drgrpo_grader.py` may print `SyntaxWarning` for regex escape sequences; these warnings are non-fatal for current evaluation runs.
 
 ## Latest SFT Experiment Status (2026-02-16)
@@ -186,6 +202,29 @@ All functions to implement are in `tests/adapters.py`. Each raises `NotImplement
 - **Best checkpoint**: step `18000`, accuracy `0.3305534496` (~33.06%).
 - **Outcome**: exceeds assignment target of at least `15%` validation accuracy on full dataset.
 
+## Latest EI Experiment Status (2026-02-21, AutoDL)
+
+- **Script**: `cs336_alignment/expert_iteration_experiment.py`
+- **Dataset**:
+  - train: `data/math/train.jsonl` (11998 rows loaded)
+  - eval: `data/math/test.jsonl` with `max_eval_samples=500`
+- **Key run config**:
+  - `n_ei_steps=5`
+  - `db_size=512`
+  - `rollouts_per_question=4`
+  - `sft_epochs_per_ei=1`
+  - `micro_batch_size=1`, `local_batch_size=32`, `lr=1e-5`
+  - `vllm_device=cuda:1`
+- **Result summary**:
+  - step0 eval accuracy: `0.040`
+  - step5 eval accuracy: `0.110`
+  - step0 -> step5 format reward: `0.244 -> 0.606`
+  - status: EI loop runs correctly, but this config is still below the `15%` target.
+- **Output directory (data disk)**:
+  - `/root/autodl-tmp/assignment5_outputs/cs336_alignment/ei_runs_formal_db512_g4_e1`
+- **W&B run**:
+  - `https://wandb.ai/762523583-national-university-of-singapore-students-union/cs336-a5-ei/runs/6zze4mni`
+
 ## W&B / Dependency Notes (2026-02-16)
 
 - Cluster network/proxy may block online sync; current workflow uses **W&B offline** logs.
@@ -196,3 +235,52 @@ All functions to implement are in `tests/adapters.py`. Each raises `NotImplement
 - After dependency edits, run:
   - `uv lock`
   - `uv sync --no-install-package flash-attn`
+- AutoDL uploads synced from offline runs include:
+  - `5ocq572h`
+  - `thrmsfms`
+  - `6zze4mni`
+
+## Storage Notes (AutoDL)
+
+- System disk (`/`) is small; keep heavy outputs on data disk:
+  - `/root/autodl-tmp/assignment5_outputs/`
+- Existing EI output symlinks in project:
+  - `cs336_alignment/ei_runs_smoke` -> data disk path
+  - `cs336_alignment/ei_runs_db512_g4_e1` -> data disk path
+
+## Latest GRPO Adapter Test Status (2026-02-24, AutoDL)
+
+- **Adapter wiring update**:
+  - `tests/adapters.py::run_compute_naive_policy_gradient_loss` is now connected to
+    `cs336_alignment.utils.compute_naive_policy_gradient_loss`.
+  - `run_compute_group_normalized_rewards` remained connected and was re-validated.
+- **Targeted pytest command**:
+  - `uv run pytest tests/test_grpo.py -k 'compute_group_normalized_rewards or compute_naive_policy_gradient_loss' -q`
+- **Result**:
+  - `test_compute_group_normalized_rewards_normalize_by_std`: PASSED
+  - `test_compute_group_normalized_rewards_no_normalize_by_std`: PASSED
+  - `test_compute_naive_policy_gradient_loss`: PASSED
+  - Summary: `3 passed, 11 deselected, 1 warning in 2.27s`
+- **Warning note**:
+  - `TRANSFORMERS_CACHE` deprecation warning from `transformers` is non-blocking.
+
+## Latest GRPO Train Loop Progress (2026-02-27, AutoDL)
+
+- **Primary file under implementation**:
+  - `cs336_alignment/grpo_train_loop.py`
+- **Current implementation state**:
+  - Phase A done: config assertions + derived sizes (`micro_train_batch_size`, prompt/microbatch counts).
+  - Phase B done: prompt-level sampling and group expansion for rollout batch construction.
+  - Phase C done: vLLM rollout path with policy->vLLM weight sync and response canonicalization.
+  - Phase D done: reward/advantage computation via `compute_group_normalized_rewards` with finite checks.
+  - Phase E done: rollout-to-training tensorization (`tokenize_prompt_and_output`, response log-prob forward).
+  - Phase F done: `old_log_probs` caching for `grpo_clip` using detached tensors.
+  - Phase G done (baseline form): microbatch updates, gradient accumulation, grad clipping, and tail-step protection.
+- **Data-format support update**:
+  - Added `cs336_alignment/data_utils.py::extract_question_and_gt` for unified MATH/GSM8K extraction.
+- **Readability/maintenance update**:
+  - Added Chinese `step/batch/microbatch` mapping comments in `grpo_train_loop.py`.
+- **Known pending items**:
+  - Make `epochs_per_rollout_batch > 1` effective (needed for off-policy GRPO experiments).
+  - Implement Phase H eval/logging (`val/reward`, `val/format_reward`, `val/answer_reward`, rollout samples).
+  - Add `Args + main` entrypoint for cleaner experiment sweeps.

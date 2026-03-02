@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Any, TYPE_CHECKING
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, PreTrainedModel
 
 import torch
@@ -5,8 +9,12 @@ from torch import Tensor
 import math
 
 from unittest.mock import patch
-from vllm import LLM
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
+
+if TYPE_CHECKING:
+    try:
+        from vllm import LLM
+    except ModuleNotFoundError:
+        LLM = Any  # type: ignore[assignment]
 
 
 
@@ -182,10 +190,25 @@ def sft_microbatch_train_step(
     loss.backward()
     return loss, {}
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+
+
+def init_vllm(
+    model_id: str,
+    device: str,
+    seed: int,
+    gpu_memory_utilization: float = 0.85,
+) -> LLM:
     """
     启动推理进程，使用 vLLM 在单独的 GPU 上加载模型
     """
+    try:
+        from vllm import LLM
+        from vllm.model_executor import set_random_seed as vllm_set_random_seed
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "vllm is required for init_vllm(). Install vllm before calling this function."
+        ) from exc
+
     vllm_set_random_seed(seed)  # 设置随机种子确保可重复性
     
     # Monkeypatch from TRL: 打补丁解决兼容性问题
@@ -207,3 +230,370 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
             gpu_memory_utilization=gpu_memory_utilization, # GPU内存使用率，默认0.85
         )
  
+
+
+#===============================进入grpo===================================
+def compute_group_normalized_rewards(
+    reward_fn,
+    rollout_responses,
+    repeated_ground_truths,
+    group_size,
+    advantage_eps,
+    normalize_by_std,
+):
+    """
+    为每个 rollout 响应计算原始奖励，并在组内进行归一化。
+
+    每个问题会生成 `group_size` 个回答（一个 group）。
+    本函数会：
+        1. 使用 reward_fn 为每个回答计算原始奖励；
+        2. 按 group 划分（同一问题的回答属于同一组）；
+        3. 在组内减去组均值（baseline）；
+        4. 若 normalize_by_std=True，则再除以组标准差（加上 advantage_eps 防止除零）；
+        5. 返回归一化后的优势值、原始奖励以及一些统计信息。
+
+    参数：
+        reward_fn (Callable[[str, str], dict[str, float]]):
+            奖励函数。输入为 (模型回答, 对应 ground truth)，
+            返回一个字典，至少包含键 "reward"。
+
+        rollout_responses (List[str]):
+            模型生成的回答列表。
+            长度必须为：
+                rollout_batch_size = n_prompts_per_rollout_batch * group_size。
+            并且排列顺序为：每连续 `group_size` 个元素对应同一个问题。
+
+        repeated_ground_truths (List[str]):
+            与 rollout_responses 等长的 ground truth 列表。
+            每个问题的 ground truth 会重复 `group_size` 次，
+            与对应的回答逐一匹配。
+
+        group_size (int):
+            每个问题对应的回答数量（即组大小）。
+
+        advantage_eps (float):
+            一个很小的常数，用于在标准化时避免除以 0：
+                std + advantage_eps。
+
+        normalize_by_std (bool):
+            若为 True：
+                执行 (reward - group_mean) / (group_std + advantage_eps)
+            若为 False：
+                仅执行 (reward - group_mean)
+
+    返回：
+        advantages (torch.Tensor):
+            形状为 (rollout_batch_size,) 的张量，
+            表示组归一化后的奖励（优势值）。
+
+        raw_rewards (torch.Tensor):
+            形状为 (rollout_batch_size,) 的张量，
+            表示未归一化的原始奖励。
+
+        metadata (dict[str, float]):
+            可选统计信息，例如：
+                - 奖励均值
+                - 奖励标准差
+                - 最小/最大值
+                - 组统计信息等
+    """
+    #safty_cheak
+    if len(rollout_responses) != len(repeated_ground_truths):
+        raise ValueError("rollout_responses and repeated_ground_truths must have the same length.")
+    if group_size <= 0:
+        raise ValueError("group_size must be > 0.")
+    if len(rollout_responses) % group_size != 0:
+        raise ValueError("rollout batch size must be divisible by group_size.")
+
+    raw_reward_list: list[float] = []
+    for response, gt in zip(rollout_responses, repeated_ground_truths):
+        reward_dict = reward_fn(response, gt)
+        raw_reward_list.append(float(reward_dict["reward"]))
+
+    raw_rewards = torch.tensor(raw_reward_list, dtype=torch.float32)
+
+    # 按组重排，组内做 baseline/归一化。
+    num_groups = raw_rewards.numel() // group_size
+    grouped = raw_rewards.view(num_groups, group_size)
+    group_mean = grouped.mean(dim=1, keepdim=True)
+
+    if normalize_by_std:
+        group_std = grouped.std(dim=1, keepdim=True, unbiased=True) #要求样本标准差而不是总体样本差
+        normalized_rewards = (grouped - group_mean) / (group_std + advantage_eps)
+    else:
+        normalized_rewards = grouped - group_mean
+
+    normalized_rewards = normalized_rewards.reshape(-1)
+    metadata = {
+        "reward_mean": float(raw_rewards.mean().item()),
+        "reward_std": float(raw_rewards.std(unbiased=False).item()),
+        "reward_min": float(raw_rewards.min().item()),
+        "reward_max": float(raw_rewards.max().item()),
+        "num_groups": float(num_groups),
+        "group_size": float(group_size),
+    }
+    return normalized_rewards, raw_rewards, metadata
+
+
+def compute_naive_policy_gradient_loss(
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+) -> torch.Tensor:
+    """
+    计算每个 token 的朴素策略梯度损失（naive policy gradient loss）。
+
+    根据公式：
+        loss_{i,t} = - A_i * log_prob_{i,t}
+
+    其中 A_i 是每条 rollout 的标量 reward 或 advantage，
+    log_prob_{i,t} 是该 rollout 在第 t 个 token 上的对数概率。
+
+    参数：
+        raw_rewards_or_advantages (torch.Tensor):
+            形状 (batch_size, 1) 或 (batch_size,)。
+            每条 rollout 对应一个标量 reward 或已经计算好的 advantage。
+
+        policy_log_probs (torch.Tensor):
+            形状 (batch_size, sequence_length)。
+            每条 rollout 中每个 token 的 log-prob。
+
+    返回：
+        torch.Tensor:
+            形状 (batch_size, sequence_length)。
+            每个 token 的策略梯度损失（尚未在 batch 或序列维度上聚合）。
+    """
+    # 接受 (B,) 或 (B,1)，统一到 (B,1)
+    if policy_log_probs.ndim != 2:
+        raise ValueError("policy_log_probs must have shape (B, T).")
+    if raw_rewards_or_advantages.ndim == 1:
+        raw_rewards_or_advantages = raw_rewards_or_advantages.unsqueeze(1)
+    elif raw_rewards_or_advantages.ndim == 2 and raw_rewards_or_advantages.shape[1] == 1:
+        pass
+    else:
+        raise ValueError(
+            "raw_rewards_or_advantages must have shape (B,) or (B,1)."
+        )
+
+    if raw_rewards_or_advantages.shape[0] != policy_log_probs.shape[0]:
+        raise ValueError("batch size mismatch.")
+
+    if not torch.isfinite(raw_rewards_or_advantages).all():
+        raise ValueError("raw_rewards_or_advantages contains NaN/Inf.")
+    if not torch.isfinite(policy_log_probs).all():
+        raise ValueError("policy_log_probs contains NaN/Inf.")
+
+    return -raw_rewards_or_advantages * policy_log_probs
+
+
+def compute_grpo_clip_loss(
+    advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    计算每个 token 的 GRPO-Clip 损失。
+
+    根据公式：
+
+        r_t = exp(policy_log_probs - old_log_probs)
+
+        loss_{i,t} = - min(
+            r_t * A_i,
+            clip(r_t, 1 - cliprange, 1 + cliprange) * A_i
+        )
+
+    其中 A_i 是每条 rollout 的标量优势值（advantage）。
+
+    参数：
+        advantages (torch.Tensor):
+            形状 (batch_size, 1) 或 (batch_size,)。
+            每条 rollout 的优势值 A。
+
+        policy_log_probs (torch.Tensor):
+            形状 (batch_size, sequence_length)。
+            当前策略在每个 token 上的 log-prob。
+
+        old_log_probs (torch.Tensor):
+            形状 (batch_size, sequence_length)。
+            旧策略在每个 token 上的 log-prob。
+
+        cliprange (float):
+            裁剪范围 ε，例如 0.2。
+            ratio 会被限制在 [1 - ε, 1 + ε] 之间。
+
+    返回：
+        loss (torch.Tensor):
+            形状 (batch_size, sequence_length)。
+            每个 token 的裁剪策略梯度损失。
+
+        metadata (dict[str, torch.Tensor]):
+            可选统计信息，例如：
+                - ratio
+                - clipped_ratio
+                - 是否发生裁剪的布尔 mask
+                - clip 比例
+    """
+        # ====== sanity checks ======
+    if policy_log_probs.ndim != 2:
+        raise ValueError("policy_log_probs must have shape (B, T).")
+
+    if old_log_probs.ndim != 2:
+        raise ValueError("old_log_probs must have shape (B, T).")
+
+    if policy_log_probs.shape != old_log_probs.shape:
+        raise ValueError("policy_log_probs and old_log_probs must have same shape.")
+
+    if advantages.ndim == 1:
+        advantages = advantages.unsqueeze(1)
+    elif advantages.ndim == 2 and advantages.shape[1] == 1:
+        pass
+    else:
+        raise ValueError("advantages must have shape (B,) or (B,1).")
+
+    if advantages.shape[0] != policy_log_probs.shape[0]:
+        raise ValueError("batch size mismatch.")
+
+    if cliprange <= 0:
+        raise ValueError("cliprange must be positive.")
+
+    if not torch.isfinite(policy_log_probs).all():
+        raise ValueError("policy_log_probs contains NaN/Inf.")
+
+    if not torch.isfinite(old_log_probs).all():
+        raise ValueError("old_log_probs contains NaN/Inf.")
+
+    if not torch.isfinite(advantages).all():
+        raise ValueError("advantages contains NaN/Inf.")
+    ratio = torch.exp(policy_log_probs - old_log_probs)
+    clipped_ratio = torch.clamp(ratio,1-cliprange,1+cliprange)
+
+    loss = -torch.minimum(advantages * ratio,advantages * clipped_ratio)
+
+    # ====== metadata ======
+    clipped_mask = (ratio != clipped_ratio)
+    clip_fraction = clipped_mask.float().mean()
+
+    metadata = {
+        "ratio": ratio.detach(),
+        "clipped_ratio": clipped_ratio.detach(),
+        "clip_fraction": clip_fraction.detach(),
+        "clipped_mask": clipped_mask.detach(),
+    }
+
+    return loss, metadata
+
+def compute_policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    #sanity check
+    valid_types = {"no_baseline", "reinforce_with_baseline", "grpo_clip"}
+    if loss_type not in valid_types:
+        raise ValueError(f"Invalid loss_type: {loss_type}")
+
+    if loss_type == "no_baseline":
+        if raw_rewards is None:
+            raise ValueError("raw_rewards required for no_baseline.")
+        return compute_naive_policy_gradient_loss(raw_rewards,policy_log_probs),{}
+
+    elif loss_type == "reinforce_with_baseline":
+        if advantages is None:
+            raise ValueError("advantages required for reinforce_with_baseline.")
+        return compute_naive_policy_gradient_loss(advantages,policy_log_probs),{}
+    elif loss_type == "grpo_clip":
+        if advantages is None:
+            raise ValueError("advantages required for grpo_clip.")
+        if old_log_probs is None:
+            raise ValueError("old_log_probs required for grpo_clip.")
+        if cliprange is None:
+            raise ValueError("cliprange required for grpo_clip.")
+        loss,metadata = compute_grpo_clip_loss(advantages,policy_log_probs,old_log_probs,cliprange)
+       
+        return loss,metadata
+
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+) -> torch.Tensor:
+    """
+    我们只希望计算response部分的loss，所以只对这部分进行计算平均
+    """
+    if tensor.shape != mask.shape:
+        raise ValueError("tensor and mask must have the same shape.")
+
+    # Convert mask to float for multiplication
+    if mask.dtype != torch.float32 and mask.dtype != torch.float64:
+        mask = mask.float()
+
+    masked_tensor = tensor * mask
+
+    if dim is None:
+        total = masked_tensor.sum()
+        count = mask.sum()
+        return total / count
+
+    total = masked_tensor.sum(dim=dim)
+    count = mask.sum(dim=dim)
+
+    return total / count
+
+    
+def grpo_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    #sanity check
+    if policy_log_probs.ndim !=2:
+        raise ValueError("policy_log_probs must have shape (B, T).")
+    if response_mask.shape != policy_log_probs.shape:
+        raise ValueError("response_mask must have the same shape as policy_log_probs.")
+    if not isinstance(gradient_accumulation_steps, int) or gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be a positive integer.")
+    if not torch.isfinite(policy_log_probs).all().item():
+        raise ValueError("policy_log_probs contains NaN/Inf.")
+
+    # 统一 mask 类型
+    if response_mask.dtype != torch.bool:
+        response_mask = response_mask.bool()
+
+    # 避免 masked_mean 出现除零 NaN（训练时更好定位问题）
+    response_token_counts = response_mask.sum(dim=1)
+    if (response_token_counts == 0).any().item():
+        raise ValueError("each sample must have at least one response token.")
+    
+
+    per_token_loss,loss_metadata = compute_policy_gradient_loss(policy_log_probs,loss_type,raw_rewards,advantages,old_log_probs,cliprange)
+
+    if per_token_loss.shape != policy_log_probs.shape:
+        raise ValueError("per_token_loss shape mismatch with policy_log_probs.")
+
+    # 3) aggregate + backward (保持你当前测试通过的逻辑)
+    masked_loss = masked_mean(per_token_loss, response_mask, dim=1)  # (B,)
+    if not torch.isfinite(masked_loss).all().item():
+        raise ValueError("masked_loss contains NaN/Inf.")  
+    
+    loss = masked_loss.mean() #变成一个数
+    loss = loss/gradient_accumulation_steps
+    if not torch.isfinite(loss).item():
+        raise ValueError("final loss is NaN/Inf.")
+    
+    loss.backward()
+
+    metadata = dict(loss_metadata)
+    metadata["mean_response_tokens"] = response_token_counts.float().mean().detach()
+    metadata["mean_masked_loss"] = masked_loss.mean().detach()
+    return loss.detach(), metadata
+
+

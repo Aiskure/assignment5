@@ -210,7 +210,22 @@ def output_strs():
 
 @pytest.fixture
 def model_id():
-    return "/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B"
+    env_model_id = os.environ.get("ASSIGNMENT5_MODEL_ID") or os.environ.get("MODEL_ID")
+    if env_model_id:
+        return env_model_id
+
+    candidate_paths = [
+        "/root/autodl-tmp/models/Qwen2.5-Math-1.5B",
+        "/root/assignment5/models/Qwen2.5-Math-1.5B",
+        "/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B",
+    ]
+    for path in candidate_paths:
+        if Path(path).exists():
+            return path
+
+    raise FileNotFoundError(
+        "Model path not found. Set ASSIGNMENT5_MODEL_ID or MODEL_ID to your local model directory."
+    )
 
 
 @pytest.fixture

@@ -9,7 +9,7 @@ import gc
 import re
 import subprocess
 import torch
-from typing import List
+from typing import Any, List
 
 
 def _normalize_cuda_visible_devices_for_vllm() -> None:
@@ -59,11 +59,22 @@ def _normalize_cuda_visible_devices_for_vllm() -> None:
 
 
 _normalize_cuda_visible_devices_for_vllm()
-from vllm import LLM, SamplingParams
+try:
+    from vllm import LLM, SamplingParams
+except ModuleNotFoundError:
+    LLM = Any  # type: ignore[assignment]
+    SamplingParams = None  # type: ignore[assignment]
 
 # 设置日志级别，减少 VLLM 的输出
 logging.getLogger("vllm").setLevel(logging.WARNING)
 os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
+
+
+def _require_vllm() -> None:
+    if SamplingParams is None:
+        raise ModuleNotFoundError(
+            "vllm is required for math_baseline evaluation. Install vllm before calling evaluate()."
+        )
 
 def evaluate_vllm(
     vllm_model: LLM,
@@ -71,11 +82,13 @@ def evaluate_vllm(
     prompts: List[str],
     eval_sampling_params
 ) -> None:
+    _require_vllm()
     outputs = vllm_model.generate(prompts, eval_sampling_params)
     res = [output.outputs[0].text for output in outputs]
     return res
     
 def evaluate(model_path,llm=None,rl=False,reward_fn=None,prompt=None):
+    _require_vllm()
     sampling_params = SamplingParams(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=["\n"]
     )
@@ -138,5 +151,19 @@ Assistant: <think>"""
         return accuracy, format_reward
     return accuracy, type1_num, type2_num, type3_num
 if __name__ == "__main__":
-    model_path = "/home/users/nus/e1553316/scratch/assignment5/models/Qwen2.5-Math-1.5B"
+    model_path = os.environ.get("ASSIGNMENT5_MODEL_ID") or os.environ.get("MODEL_ID")
+    if model_path is None:
+        candidate_paths = [
+            "/root/autodl-tmp/models/Qwen2.5-Math-1.5B",
+            "/root/assignment5/models/Qwen2.5-Math-1.5B",
+            "/home/users/nus/e1553316/scratch/assignment5/models/Qwen2.5-Math-1.5B",
+        ]
+        for path in candidate_paths:
+            if os.path.exists(path):
+                model_path = path
+                break
+    if model_path is None:
+        raise FileNotFoundError(
+            "Model path not found. Set ASSIGNMENT5_MODEL_ID or MODEL_ID to your local model directory."
+        )
     evaluate(model_path)
