@@ -169,7 +169,19 @@ def masked_normalize(
     normalize_constant: float,
     dim: int | None = None,
 ) -> torch.Tensor:
-    return (tensor * mask).sum(dim=dim)/normalize_constant
+    # 1. 安全检查：形状对齐
+    if tensor.shape != mask.shape:
+        raise ValueError(f"Shape mismatch: tensor {tensor.shape} != mask {mask.shape}")
+    
+    # 2. 类型对齐：将 mask 转为与 tensor 相同的数据类型（比如 bfloat16），防止类型冲突
+    if mask.dtype != tensor.dtype:
+        mask = mask.to(tensor.dtype)
+        
+    # 3. 核心计算
+    masked_tensor = tensor * mask
+    
+    # torch.sum 在 dim=None 时默认会对所有维度求和，所以不需要额外写 if dim is None
+    return masked_tensor.sum(dim=dim) / normalize_constant
 
 def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -553,6 +565,7 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    loss_aggregation: Literal["masked_mean", "masked_normalize"] = "masked_normalize",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     #sanity check
     if policy_log_probs.ndim !=2:
@@ -579,8 +592,12 @@ def grpo_microbatch_train_step(
     if per_token_loss.shape != policy_log_probs.shape:
         raise ValueError("per_token_loss shape mismatch with policy_log_probs.")
 
-    # 3) aggregate + backward (保持你当前测试通过的逻辑)
-    masked_loss = masked_mean(per_token_loss, response_mask, dim=1)  # (B,)
+    # 3) aggregate + backward
+    if loss_aggregation == "masked_normalize":
+        max_gen_len = float(response_mask.shape[1])
+        masked_loss = masked_normalize(per_token_loss, response_mask, normalize_constant=max_gen_len, dim=1)  # (B,)
+    else:
+        masked_loss = masked_mean(per_token_loss, response_mask, dim=1)  # (B,)
     if not torch.isfinite(masked_loss).all().item():
         raise ValueError("masked_loss contains NaN/Inf.")  
     

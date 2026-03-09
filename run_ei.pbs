@@ -1,0 +1,85 @@
+#!/bin/bash
+#PBS -l select=1:ngpus=2:mem=128gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+PROJECT=/scratch/users/nus/e1553316/assignment5
+cd "$PROJECT"
+source .venv/bin/activate
+
+# 从 qsub -v 传入的参数（有默认值）
+EI_G="${EI_G:-4}"
+EI_DB="${EI_DB:-1024}"
+EI_EPOCHS="${EI_EPOCHS:-1}"
+RUN_NAME="${RUN_NAME:-ei_G${EI_G}_Db${EI_DB}_E${EI_EPOCHS}}"
+OUTPUT_DIR="outputs/ei/${RUN_NAME}"
+
+mkdir -p "$OUTPUT_DIR"
+
+export ASSIGNMENT5_MODEL_ID="$PROJECT/models/Qwen2.5-Math-1.5B"
+export HF_HOME=/scratch/users/nus/e1553316/.cache/huggingface
+export VLLM_LOGGING_LEVEL=WARNING
+export WANDB_MODE=offline
+
+echo "========================================="
+echo "[PBS] EI start  $(date)  RUN=${RUN_NAME}"
+echo "[PBS] G=${EI_G}  D_b=${EI_DB}  epochs=${EI_EPOCHS}"
+echo "========================================="
+
+MODEL_ARGS=(
+  --model-path      "$ASSIGNMENT5_MODEL_ID"
+  --train-path      data/math/train.jsonl
+  --validation-path data/math/validation.jsonl
+  --output-dir      "$OUTPUT_DIR"
+)
+
+EI_ARGS=(
+  --seed                  42
+  --n-ei-steps            5
+  --db-size               "$EI_DB"
+  --rollouts-per-question "$EI_G"
+  --sft-epochs-per-ei     "$EI_EPOCHS"
+)
+
+TRAIN_ARGS=(
+  --micro-batch-size  1
+  --local-batch-size  32
+  --lr                1e-5
+)
+
+ROLLOUT_ARGS=(
+  --vllm-device             cuda:1
+  --gpu-memory-utilization  0.85
+  --rollout-temperature     1.0
+  --rollout-top-p           1.0
+  --rollout-max-tokens      1024
+)
+
+EVAL_ARGS=(
+  --max-eval-samples  1024
+  --eval-temperature  1.0
+  --eval-top-p        1.0
+  --eval-max-tokens   1024
+)
+
+WANDB_ARGS=(
+  --use-wandb
+  --wandb-project  cs336-a5
+  --wandb-group    ei
+  --wandb-run-name "$RUN_NAME"
+)
+
+uv run python -m cs336_alignment.expert_iteration_experiment \
+  "${MODEL_ARGS[@]}" \
+  "${EI_ARGS[@]}" \
+  "${TRAIN_ARGS[@]}" \
+  "${ROLLOUT_ARGS[@]}" \
+  "${EVAL_ARGS[@]}" \
+  --save-each-step \
+  "${WANDB_ARGS[@]}"
+
+echo "========================================="
+echo "[PBS] EI finished  $(date)"
+echo "========================================="

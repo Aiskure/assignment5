@@ -1,19 +1,26 @@
-try:
-    from drgrpo_grader import r1_zero_reward_fn
-except:
-    from .drgrpo_grader import r1_zero_reward_fn
+from __future__ import annotations
+
+import argparse
 import json
 import logging
 import os
-import gc
+import random
 import re
 import subprocess
+from typing import Any, Callable
+
 import torch
-from typing import Any, List
+
+try:
+    from drgrpo_grader import r1_zero_reward_fn
+    from data_utils import extract_question_and_gt
+except Exception:
+    from .drgrpo_grader import r1_zero_reward_fn
+    from .data_utils import extract_question_and_gt
 
 
 def _normalize_cuda_visible_devices_for_vllm() -> None:
-    """Map PBS/NVIDIA UUID-based CUDA_VISIBLE_DEVICES to index IDs for vLLM."""
+    """Convert UUID-style CUDA_VISIBLE_DEVICES to numeric indices for vLLM."""
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     if not visible_devices or "GPU-" not in visible_devices:
         return
@@ -35,13 +42,13 @@ def _normalize_cuda_visible_devices_for_vllm() -> None:
         )
         return
 
-    uuid_to_index = {}
+    uuid_to_index: dict[str, str] = {}
     for line in result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
         if len(parts) >= 2 and parts[0].isdigit():
             uuid_to_index[parts[1]] = parts[0]
 
-    mapped_tokens = []
+    mapped_tokens: list[str] = []
     for token in raw_tokens:
         if token.isdigit():
             mapped_tokens.append(token)
@@ -65,9 +72,13 @@ except ModuleNotFoundError:
     LLM = Any  # type: ignore[assignment]
     SamplingParams = None  # type: ignore[assignment]
 
-# 设置日志级别，减少 VLLM 的输出
+
 logging.getLogger("vllm").setLevel(logging.WARNING)
 os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
+
+DEFAULT_PROMPT = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
+User: {question}
+Assistant: <think>"""
 
 
 def _require_vllm() -> None:
@@ -76,94 +87,202 @@ def _require_vllm() -> None:
             "vllm is required for math_baseline evaluation. Install vllm before calling evaluate()."
         )
 
-def evaluate_vllm(
+
+def _resolve_model_path() -> str | None:
+    model_path = os.environ.get("ASSIGNMENT5_MODEL_ID") or os.environ.get("MODEL_ID")
+    if model_path:
+        return model_path
+
+    candidate_paths = [
+        "/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B",
+        "/root/autodl-tmp/models/Qwen2.5-Math-1.5B",
+        "/root/assignment5/models/Qwen2.5-Math-1.5B",
+        "models/Qwen2.5-Math-1.5B",
+    ]
+    for path in candidate_paths:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def generate_vllm_outputs(
     vllm_model: LLM,
-    reward_fn: callable,
-    prompts: List[str],
-    eval_sampling_params
-) -> None:
+    prompts: list[str],
+    eval_sampling_params: SamplingParams,
+) -> list[str]:
     _require_vllm()
     outputs = vllm_model.generate(prompts, eval_sampling_params)
-    res = [output.outputs[0].text for output in outputs]
-    return res
-    
-def evaluate(model_path,llm=None,rl=False,reward_fn=None,prompt=None):
+    return [output.outputs[0].text for output in outputs]
+
+
+def _load_eval_examples(
+    dataset_path: str,
+    max_eval_samples: int,
+    sampling_strategy: str,
+    sample_seed: int,
+) -> list[dict[str, str]]:
+    examples: list[dict[str, str]] = []
+    with open(dataset_path, "r", encoding="utf-8") as f:
+        for line_idx, line in enumerate(f, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            row = json.loads(text)
+            try:
+                question, answer = extract_question_and_gt(row)
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Skip invalid row at %s:%d (%s)", dataset_path, line_idx, exc
+                )
+                continue
+
+            examples.append(
+                {
+                    "unique_id": str(row.get("unique_id", f"row-{line_idx}")),
+                    "question": question,
+                    "ground_truth": answer,
+                }
+            )
+
+    if not examples:
+        raise ValueError(f"No valid evaluation examples found in {dataset_path}")
+
+    if max_eval_samples > 0 and len(examples) > max_eval_samples:
+        if sampling_strategy == "first_n":
+            examples = examples[:max_eval_samples]
+        elif sampling_strategy == "seeded_random":
+            rng = random.Random(sample_seed)
+            indices = rng.sample(range(len(examples)), max_eval_samples)
+            indices.sort()
+            examples = [examples[idx] for idx in indices]
+        else:
+            raise ValueError(f"Unknown sampling_strategy: {sampling_strategy}")
+    return examples
+
+
+def evaluate(
+    model_path: str,
+    llm: LLM | None = None,
+    rl: bool = False,
+    reward_fn: Callable[[str, str], dict[str, float]] | None = None,
+    prompt: str | None = None,
+    dataset_path: str = "data/math/validation.jsonl",
+    max_eval_samples: int = 1024,
+    output_dir: str | None = None,
+    sampling_strategy: str = "seeded_random",
+    sample_seed: int = 42,
+) -> tuple[float, float] | tuple[float, int, int, int]:
     _require_vllm()
     sampling_params = SamplingParams(
-        temperature=1.0, top_p=1.0, max_tokens=1024, stop=["\n"]
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=1024,
+        stop=["</answer>"],
     )
-    sampling_params.stop = ["</answer>"]
     sampling_params.include_stop_str_in_output = True
+
     if llm is None:
-        llm = LLM(model=model_path, gpu_memory_utilization=0.8,dtype=torch.float16)
+        llm = LLM(model=model_path, gpu_memory_utilization=0.8, dtype=torch.float16)
     if reward_fn is None:
         reward_fn = r1_zero_reward_fn
     if prompt is None:
-        prompt = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
-User: {question}
-Assistant: <think>"""
-    gsm8k = []
-    with open("data/gsm8k/test.jsonl") as f:
-        lines = f.readlines()
-        for line in lines:
-            gsm8k.append(json.loads(line))
-    prompts = []
-    answer = []
-    for dict in gsm8k:
-        prompts.append(prompt.format(question=dict['question']))
-        answer.append(dict['answer'][dict['answer'].find("####") + 5:])
-    print(len(prompts))
-    outputs = evaluate_vllm(llm, reward_fn, prompts, sampling_params)
-    acc = 0
-    format_reward = 0
+        prompt = DEFAULT_PROMPT
+
+    examples = _load_eval_examples(
+        dataset_path=dataset_path,
+        max_eval_samples=max_eval_samples,
+        sampling_strategy=sampling_strategy,
+        sample_seed=sample_seed,
+    )
+    prompts = [prompt.format(question=ex["question"]) for ex in examples]
+    answers = [ex["ground_truth"] for ex in examples]
+    outputs = generate_vllm_outputs(llm, prompts, sampling_params)
+
+    acc = 0.0
+    format_reward = 0.0
     type1_num = 0
     type2_num = 0
     type3_num = 0
-    for i in range(len(outputs)):
-        full_response = outputs[i]
+    records: list[dict[str, Any]] = []
+
+    for ex, gt, raw_output in zip(examples, answers, outputs):
+        full_response = raw_output
         if not full_response.lstrip().startswith("<think>"):
             full_response = "<think>" + full_response
-
-        # r1_zero_reward_fn strictly checks for "</think> <answer>".
         full_response = re.sub(r"</think>\s*<answer>", "</think> <answer>", full_response)
 
-        gsm8k[i]['outputs'] = full_response
-        result = reward_fn(full_response, answer[i])
-        gsm8k[i]['result'] = result
-        if result['format_reward'] == 1.0 and result['answer_reward'] == 1.0:
-            type = 1
+        result = reward_fn(full_response, gt)
+        if result["format_reward"] == 1.0 and result["answer_reward"] == 1.0:
+            sample_type = 1
             type1_num += 1
-        elif result['format_reward'] == 1.0 and result['answer_reward'] == 0.0:
-            type = 2
+        elif result["format_reward"] == 1.0 and result["answer_reward"] == 0.0:
+            sample_type = 2
             type2_num += 1
         else:
-            type = 3
+            sample_type = 3
             type3_num += 1
-        gsm8k[i]['type'] = type
-        acc += result['reward']
-        if rl == True:
-            format_reward += result['format_reward']
+
+        records.append(
+            {
+                "unique_id": ex["unique_id"],
+                "question": ex["question"],
+                "ground_truth": gt,
+                "raw_output": raw_output,
+                "output": full_response,
+                "result": result,
+                "type": sample_type,
+            }
+        )
+        acc += float(result["reward"])
+        format_reward += float(result["format_reward"])
+
     accuracy = acc / len(outputs)
-    format_reward = format_reward / len(outputs)
-    with open(f"{model_path}/test_log.json",'w') as f:
-        json.dump(gsm8k,f,indent=4)
-    if rl == True:
-        return accuracy, format_reward
+    avg_format_reward = format_reward / len(outputs)
+
+    save_dir = output_dir or model_path
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, "test_log.json"), "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+
+    if rl:
+        return accuracy, avg_format_reward
     return accuracy, type1_num, type2_num, type3_num
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Baseline evaluation on MATH validation set.")
+    parser.add_argument("--model-path", type=str, default=_resolve_model_path())
+    parser.add_argument("--dataset-path", type=str, default="data/math/validation.jsonl")
+    parser.add_argument("--max-eval-samples", type=int, default=1024)
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--sampling-strategy",
+        type=str,
+        default="seeded_random",
+        choices=["seeded_random", "first_n"],
+    )
+    parser.add_argument("--sample-seed", type=int, default=42)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    model_path = os.environ.get("ASSIGNMENT5_MODEL_ID") or os.environ.get("MODEL_ID")
-    if model_path is None:
-        candidate_paths = [
-            "/root/autodl-tmp/models/Qwen2.5-Math-1.5B",
-            "/root/assignment5/models/Qwen2.5-Math-1.5B",
-            "/home/users/nus/e1553316/scratch/assignment5/models/Qwen2.5-Math-1.5B",
-        ]
-        for path in candidate_paths:
-            if os.path.exists(path):
-                model_path = path
-                break
-    if model_path is None:
+    args = parse_args()
+    if not args.model_path:
         raise FileNotFoundError(
             "Model path not found. Set ASSIGNMENT5_MODEL_ID or MODEL_ID to your local model directory."
         )
-    evaluate(model_path)
+
+    accuracy, type1_num, type2_num, type3_num = evaluate(
+        model_path=args.model_path,
+        dataset_path=args.dataset_path,
+        max_eval_samples=args.max_eval_samples,
+        output_dir=args.output_dir,
+        sampling_strategy=args.sampling_strategy,
+        sample_seed=args.sample_seed,
+    )
+    print(
+        f"[DONE] accuracy={accuracy:.6f}, "
+        f"type1/type2/type3={type1_num}/{type2_num}/{type3_num}, "
+        f"dataset={args.dataset_path}, max_eval_samples={args.max_eval_samples}, "
+        f"sampling_strategy={args.sampling_strategy}, sample_seed={args.sample_seed}"
+    )

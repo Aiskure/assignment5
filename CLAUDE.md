@@ -17,8 +17,8 @@ This is **Stanford CS336 Spring 2025 Assignment 5: Alignment** - a publicly avai
 This project implements LLM alignment techniques (SFT, Expert Iteration, GRPO) using Qwen 2.5 Math 1.5B.
 
 **Important dataset note**:
-- **Current working dataset (GRPO / EI)**: local **MATH-format** dataset at `data/math/*.jsonl`.
-- **GSM8K** is kept for baseline/SFT historical evaluation and comparison scripts.
+- **Current working dataset (Baseline / GRPO / EI)**: local **MATH-format** dataset at `data/math/*.jsonl`.
+- **GSM8K** is kept as historical baseline/SFT comparison data.
 
 ## Repository Structure
 
@@ -52,15 +52,34 @@ assignment5/
 
 ## Key Information
 
-- **Model**: Qwen 2.5 Math 1.5B (set via `ASSIGNMENT5_MODEL_ID`; AutoDL default: `/root/autodl-tmp/models/Qwen2.5-Math-1.5B`)
+- **Model**: Qwen 2.5 Math 1.5B (set via `ASSIGNMENT5_MODEL_ID`; current NSCC path: `/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B`; AutoDL historical path: `/root/autodl-tmp/models/Qwen2.5-Math-1.5B`)
 - **Dataset**:
-  - `data/math/*.jsonl` for current GRPO train loop and EI experiments
+  - `data/math_origin/`：原始 MATH 数据（train 12000 + test 500 = 12500）
+  - `data/math/train.jsonl`：7500 条（训练集，从 math_origin 重新划分）
+  - `data/math/validation.jsonl`：5000 条（验证集，从 math_origin 重新划分）
+  - 默认评估从 `validation` 中抽样 1024 条（`max_eval_samples=1024`，`sampling_strategy=seeded_random`，`sample_seed=42`）
+  - 如需固定前 1024 条可用 `sampling_strategy=first_n`
+  - 最终测试可用全部 5000 条（`max_eval_samples=0`）
   - `data/gsm8k/*.jsonl` for baseline / SFT historical comparison runs
 - **Package manager**: `uv` (not pip)
 - **Python**: 3.11 or 3.12 (not 3.13)
 - **Current focus**: GRPO train loop + Expert Iteration on MATH-format data
 
-## Current Environment (AutoDL, 2026-02-20)
+## Current Environment (NSCC, 2026-03-06)
+
+- **平台**: NSCC (National Supercomputing Centre Singapore)
+- **地理位置**: 新加坡
+- **当前登录节点**: `asp2a-login-nus02`
+- **GPU**: 4x NVIDIA A100 40GB per job
+- **总显存**: 160GB per job
+- **项目路径**: `/scratch/users/nus/e1553316/assignment5`
+- **模型路径**: `/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B`
+- **注意事项**:
+  - 推荐设置 `ASSIGNMENT5_MODEL_ID=/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B`
+  - 登录节点不适合做 GPU 编译或推理；需要通过 PBS/交互作业进入计算节点
+  - NSCC 环境下仍建议显式设置 `HF_HOME`，避免缓存落到默认目录
+
+## Historical Environment (AutoDL, 2026-02-20)
 
 - **平台**: AutoDL (中国)
 - **GPU**: 2x NVIDIA A800 80GB PCIe
@@ -68,17 +87,7 @@ assignment5/
 - **CPU / RAM**: 28 cores / 200 GB
 - **项目路径**: `/root/assignment5`
 - **数据盘**: `/root/autodl-tmp`（模型与缓存放这里，避免系统盘占满）
-- **注意事项**:
-  - 推荐设置 `ASSIGNMENT5_MODEL_ID=/root/autodl-tmp/models/Qwen2.5-Math-1.5B`
-  - 推荐使用 `HF_HOME`，不再依赖 `TRANSFORMERS_CACHE`
-  - `flash-attn` 已在 CUDA 12.4 环境下编译通过（A800 架构 `sm80`）
-
-## Legacy Environment (NSCC, historical records)
-
-- **集群**: NSCC (National Supercomputing Centre Singapore)
-- **GPU**: 4x NVIDIA A100 40GB per job
-- **总显存**: 160GB per job
-- **说明**: 该环境用于历史实验记录，对当前 AutoDL 运行不再作为默认配置
+- **说明**: 该环境保留为 2026-02-20 至 2026-02-21 的迁移与实验记录
 
 ## Development Workflow
 
@@ -149,6 +158,30 @@ All functions to implement are in `tests/adapters.py`. Each raises `NotImplement
 - `vllm` for efficient inference/rollout generation
 - `wandb` for experiment tracking
 
+## 实验记录.md 维护规范
+
+- 每个自然日只有一个 `## Day N (YYYY-MM-DD)` 大标题，不得为同一天的不同任务创建多个 Day 条目。
+- 同一天内的多项工作用 `###` 小节区分，不单开新的 `##` 大标题。
+- "Day N 补充"等写法禁止使用，直接追加到当天的 `## Day N` 章节下。
+
+## W&B 输出目录规范
+
+- 调用 `wandb.init()` 时**必须**传 `dir=str(output_dir)`，使 wandb run 落在各实验自己的输出目录下（如 `outputs/ei/run1_ei/wandb/`），而非项目根目录的 `wandb/`。
+- `wandb sync` 路径因此变为 `outputs/<experiment>/<run_name>/wandb/offline-run-xxx`。
+
+## Shell 脚本风格规范
+
+- **禁止**使用单一 `cmd=(...)` 数组拼接整条命令。
+- **禁止**使用反引号注释续行风格：`` `# 注释` \ ``。
+- **推荐**：按参数语义分组，每组用独立命名数组，最后展开拼接。示例：
+  ```bash
+  MODEL_ARGS=(--model-path "$MODEL" --train-path data/train.jsonl)
+  EI_ARGS=(--seed 42 --n-ei-steps 5)
+  uv run python -m module \
+    "${MODEL_ARGS[@]}" \
+    "${EI_ARGS[@]}"
+  ```
+
 ## GSM8K Dataset Notes
 
 - GSM8K 是小学数学应用题数据集，比 MATH 更简单
@@ -170,7 +203,7 @@ All functions to implement are in `tests/adapters.py`. Each raises `NotImplement
 #SBATCH --time=04:00:00
 ```
 
-## Latest Evaluation Status (2026-02-20, AutoDL)
+## Historical Evaluation Status (2026-02-20, AutoDL)
 
 - **Current baseline evaluation** has completed on GSM8K test split using `cs336_alignment/math_baseline.py` in AutoDL.
 - **Result summary** (from `test_log.json`, n=1319):
@@ -184,11 +217,45 @@ All functions to implement are in `tests/adapters.py`. Each raises `NotImplement
 - Use this command in project root:
   - `uv run python -m cs336_alignment.math_baseline`
 - Set model path with environment variable:
-  - `export ASSIGNMENT5_MODEL_ID=/root/autodl-tmp/models/Qwen2.5-Math-1.5B`
+  - `export ASSIGNMENT5_MODEL_ID=/scratch/users/nus/e1553316/assignment5/models/Qwen2.5-Math-1.5B`
 - Do **not** use `uv python cs336_alignment/math_baseline.py` (invalid `uv` subcommand usage).
-- `math_baseline.py` expects `data/gsm8k/test.jsonl` for evaluation input.
+- Current `math_baseline.py` defaults:
+  - `dataset_path=data/math/validation.jsonl`
+  - `max_eval_samples=1024`
+  - `sampling_strategy=seeded_random`
+  - `sample_seed=42`
+- Useful overrides:
+  - `--max-eval-samples 0` for full validation (5000)
+  - `--sampling-strategy first_n` for fixed leading subset
+  - `--sample-seed <int>` for reproducible random subset
 - In NSCC PBS jobs, `CUDA_VISIBLE_DEVICES` may be UUID-based (`GPU-...`). This is retained as legacy compatibility logic.
 - `drgrpo_grader.py` may print `SyntaxWarning` for regex escape sequences; these warnings are non-fatal for current evaluation runs.
+
+## Latest Baseline/SFT Script Update (2026-03-07, NSCC)
+
+- `cs336_alignment/math_baseline.py` now evaluates on MATH validation by default, with reproducible seeded sampling (`seeded_random`, `sample_seed=42`, `max_eval_samples=1024`).
+- `math_baseline.py` keeps backward compatibility for existing call style `evaluate(str(step_dir), llm)`.
+- `cs336_alignment/sft.py` periodic eval now passes `sample_seed=args.seed` into `evaluate(...)`, so eval subset selection is reproducible across the whole run.
+- `evaluate_vllm` renamed to `generate_vllm_outputs` (clearer responsibility).
+- `records` in `evaluate()` now includes `raw_output` (vLLM raw text before `<think>` prepend) alongside `output` (normalized).
+
+## Output Directory Convention (2026-03-07)
+
+All experiment outputs are unified under `outputs/` in the project root:
+
+```
+outputs/
+├── baseline/
+│   └── math_val_1024_seed42/   # test_log.json
+├── grpo/
+│   └── run1_grpo_clip/         # config.json, metrics_history.json, rollout_examples.json, final_checkpoint/
+└── ei/
+    └── run1_xxx/
+```
+
+- `run_math_baseline.sh` default: `outputs/baseline/math_val_1024_seed42`
+- `run_grpo.sh` default: `outputs/grpo/run1_grpo_clip`
+- Override via env var: `OUTPUT_DIR=outputs/baseline/math_val_5000 bash run_math_baseline.sh`
 
 ## Latest SFT Experiment Status (2026-02-16)
 
@@ -264,23 +331,23 @@ All functions to implement are in `tests/adapters.py`. Each raises `NotImplement
 - **Warning note**:
   - `TRANSFORMERS_CACHE` deprecation warning from `transformers` is non-blocking.
 
-## Latest GRPO Train Loop Progress (2026-02-27, AutoDL)
+## Latest GRPO Train Loop Progress (2026-03-07, NSCC)
 
-- **Primary file under implementation**:
-  - `cs336_alignment/grpo_train_loop.py`
-- **Current implementation state**:
-  - Phase A done: config assertions + derived sizes (`micro_train_batch_size`, prompt/microbatch counts).
-  - Phase B done: prompt-level sampling and group expansion for rollout batch construction.
-  - Phase C done: vLLM rollout path with policy->vLLM weight sync and response canonicalization.
-  - Phase D done: reward/advantage computation via `compute_group_normalized_rewards` with finite checks.
-  - Phase E done: rollout-to-training tensorization (`tokenize_prompt_and_output`, response log-prob forward).
-  - Phase F done: `old_log_probs` caching for `grpo_clip` using detached tensors.
-  - Phase G done (baseline form): microbatch updates, gradient accumulation, grad clipping, and tail-step protection.
-- **Data-format support update**:
-  - Added `cs336_alignment/data_utils.py::extract_question_and_gt` for unified MATH/GSM8K extraction.
-- **Readability/maintenance update**:
-  - Added Chinese `step/batch/microbatch` mapping comments in `grpo_train_loop.py`.
+- **Primary file**: `cs336_alignment/grpo_train_loop.py`
+- **Status**: ALL phases complete + 3 bug fixes + Day 9 improvements (see 实验记录.md)
+- **Key additions (Day 9)**:
+  - `tqdm` progress bar on outer GRPO step loop (+ nested microbatch bar with `leave=False`)
+  - UUID normalization refactored: imports `_normalize_cuda_visible_devices_for_vllm` from `math_baseline` (no duplication)
+  - W&B offline support: `--wandb-project` (optional), `--wandb-offline` (default True); upload via `wandb sync <output_dir>/wandb/`
+  - Smoke test passed (2 steps, reinforce_with_baseline, lr=1e-5)
+- **CLI entrypoint**: `uv run python -m cs336_alignment.grpo_train_loop`
+- **Formal run config** (`run_grpo.sh`): `--output-dir grpo_runs/run1_grpo_clip --n-grpo-steps 256 --eval-every-steps 10 --loss-type grpo_clip --lr 1e-6`
+- **Default hyperparams**: `rollout_batch_size=256, group_size=8, gradient_accumulation_steps=128`
+- **Output files** (in `--output-dir`): `config.json`, `metrics_history.json`, `rollout_examples.json`, `final_checkpoint/`, `wandb/` (if enabled)
+- **Data split**:
+  - `data/math/train.jsonl`: 7500 (training)
+  - `data/math/validation.jsonl`: 5000 (validation)
+  - Training-time periodic eval: `max_eval_samples=1024` (first 1024 of val set)
+  - Final test: `max_eval_samples=0` (all 5000)
 - **Known pending items**:
-  - Make `epochs_per_rollout_batch > 1` effective (needed for off-policy GRPO experiments).
-  - Implement Phase H eval/logging (`val/reward`, `val/format_reward`, `val/answer_reward`, rollout samples).
-  - Add `Args + main` entrypoint for cleaner experiment sweeps.
+  - Run formal GRPO experiment (256 steps, grpo_clip) on NSCC.
