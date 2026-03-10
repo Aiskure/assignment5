@@ -307,7 +307,7 @@ def grpo_train_loop(
     sampling_min_tokens: int = 4,
     sampling_max_tokens: int = 1024,
     advantage_eps: float = 1e-6,
-    use_std_normalization: bool = False,
+    use_std_normalization: bool = True,
     reward_fn: Callable = r1_zero_reward_fn,
     eval_every_steps: int = 10,
     max_eval_samples: int = 1024,
@@ -447,16 +447,21 @@ def grpo_train_loop(
 
         # 阶段 F: old_log_probs
         # grpo_clip 模式下，每个 rollout batch 只缓存一次 old log-probs（不参与梯度）。
-        # 用 torch.no_grad() 避免建图，节省显存。
+        # 用 microbatch 循环分批计算，避免全批次 forward 导致 OOM。
         if loss_type == "grpo_clip":
+            old_log_probs_list = []
             with torch.no_grad():
-                old_out = utils.get_response_log_probs(
-                    model=policy,
-                    input_ids=input_ids,
-                    labels=labels,
-                    return_token_entropy=False,
-                )
-                old_log_probs = old_out["log_probs"].detach()
+                for mb_idx in range(n_microbatches_per_rollout_batch):
+                    s = mb_idx * micro_train_batch_size
+                    e = s + micro_train_batch_size
+                    mb_out = utils.get_response_log_probs(
+                        model=policy,
+                        input_ids=input_ids[s:e],
+                        labels=labels[s:e],
+                        return_token_entropy=False,
+                    )
+                    old_log_probs_list.append(mb_out["log_probs"].detach())
+            old_log_probs = torch.cat(old_log_probs_list, dim=0)
         else:
             old_log_probs = None
 
@@ -662,7 +667,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sampling-max-tokens", type=int, default=1024)
 
     parser.add_argument("--advantage-eps", type=float, default=1e-6)
-    parser.add_argument("--use-std-normalization", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use-std-normalization", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eval-every-steps", type=int, default=10)
     parser.add_argument("--max-eval-samples", type=int, default=1024)
     parser.add_argument("--eval-temperature", type=float, default=1.0)
