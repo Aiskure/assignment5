@@ -297,6 +297,8 @@ def grpo_train_loop(
     loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
     model_id: str,
     loss_aggregation: Literal["masked_mean", "masked_normalize"] = "masked_normalize",
+    kl_coef: float = 0.0,
+    group_filter: bool = False,
     train_batch_size: int | None = None,
     epochs_per_rollout_batch: int = 1,
     seed: int | None = None,
@@ -334,6 +336,20 @@ def grpo_train_loop(
     micro_train_batch_size = config["micro_train_batch_size"]
     n_microbatches_per_rollout_batch = config["n_microbatches_per_rollout_batch"]
     n_prompts_per_rollout_batch = config["n_prompts_per_rollout_batch"]
+
+    # 阶段 B.5：加载冻结 ref model（用于 KL-in-loss）
+    train_device = next(policy.parameters()).device
+    if kl_coef > 0.0:
+        from transformers import AutoModelForCausalLM
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=next(policy.parameters()).dtype, local_files_only=True
+        ).to(train_device)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+        print(f"[INFO] Loaded frozen ref model for KL loss (kl_coef={kl_coef})")
+    else:
+        ref_model = None
 
     # 阶段 C：rollout 生成初始化（只做一次）
     vllm_model = utils.init_vllm(
@@ -409,6 +425,7 @@ def grpo_train_loop(
             group_size=group_size,
             advantage_eps=advantage_eps,
             normalize_by_std=use_std_normalization,
+            filter_zero_std_groups=group_filter,
         )
 
         if advantages.shape[0] != rollout_batch_size:
@@ -427,6 +444,8 @@ def grpo_train_loop(
         step_entropy_count = 0
         step_clip_fraction_total = 0.0
         step_clip_fraction_count = 0
+        step_kl_total = 0.0
+        step_kl_count = 0
         last_grad_norm = 0.0
 
         #阶段 E:把rollout转换为训练张量
@@ -494,6 +513,18 @@ def grpo_train_loop(
                 mb_advantages = advantages[s:e]
                 mb_old_log_probs = old_log_probs[s:e] if old_log_probs is not None else None
 
+                if ref_model is not None:
+                    with torch.no_grad():
+                        ref_out = utils.get_response_log_probs(
+                            model=ref_model,
+                            input_ids=input_ids[s:e],
+                            labels=labels[s:e],
+                            return_token_entropy=False,
+                        )
+                    mb_ref_log_probs = ref_out["log_probs"].detach()
+                else:
+                    mb_ref_log_probs = None
+
                 loss , loss_metadata = grpo_microbatch_train_step(
                     mb_policy_log_probs,
                     mb_response_mask,
@@ -504,6 +535,8 @@ def grpo_train_loop(
                     mb_old_log_probs,
                     cliprange=0.2,
                     loss_aggregation=loss_aggregation,
+                    ref_log_probs=mb_ref_log_probs,
+                    kl_coef=kl_coef,
                 )
                 step_loss_total += float(loss.item())
                 step_loss_count += 1
@@ -519,6 +552,9 @@ def grpo_train_loop(
                     n_response_tokens = mb_response_mask.float().sum().clamp(min=1.0)
                     step_clip_fraction_total += float((masked_clip / n_response_tokens).item())
                     step_clip_fraction_count += 1
+                if "kl_loss" in loss_metadata:
+                    step_kl_total += float(loss_metadata["kl_loss"].item())
+                    step_kl_count += 1
 
                 if (mb_idx + 1) % gradient_accumulation_steps == 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
@@ -544,6 +580,10 @@ def grpo_train_loop(
         }
         if step_clip_fraction_count:
             step_metrics["train/clip_fraction"] = step_clip_fraction_total / step_clip_fraction_count
+        if step_kl_count:
+            step_metrics["train/kl_loss"] = step_kl_total / step_kl_count
+        if group_filter:
+            step_metrics["train/filtered_groups"] = float(reward_metadata.get("filtered_groups", 0.0))
 
         # Validation 不是每个 step 都跑：按 eval_every_steps 周期执行，
         # 但最后一个 step 无论如何都补一次，保证训练结束时有最终验证结果。
@@ -653,6 +693,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=128)
     parser.add_argument("--loss-type", type=str, default="grpo_clip",
                         choices=["no_baseline", "reinforce_with_baseline", "grpo_clip"])
+    parser.add_argument("--kl-coef", type=float, default=0.0)
+    parser.add_argument("--group-filter", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--loss-aggregation", type=str, default="masked_normalize",
                         choices=["masked_mean", "masked_normalize"])
     parser.add_argument("--train-batch-size", type=int, default=None)
@@ -744,6 +786,8 @@ def main() -> None:
         loss_type=args.loss_type,
         model_id=args.model_path,
         loss_aggregation=args.loss_aggregation,
+        kl_coef=args.kl_coef,
+        group_filter=args.group_filter,
         train_batch_size=args.train_batch_size,
         epochs_per_rollout_batch=args.epochs_per_rollout_batch,
         seed=args.seed,

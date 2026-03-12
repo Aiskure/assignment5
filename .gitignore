@@ -6,14 +6,50 @@ wandb/
 sft_eval/
 cs336_alignment/sft_eval/
 sft_export_*/
-data/
 outputs/
+
+# Dataset (only keep math split)
+/data/*
+!/data/math
 
 # PBS job logs
 *.o[0-9]*
 
 # Personal draft notes
 建议.md
+CLAUDE.md
+kl_in_loss_explanation.md
+plan.md
+
+# PBS job scripts (HPC-specific)
+*.pbs
+
+# Scratch / exploratory code
+simple/
+verl/
+assert/
+
+# Misc
+CHANGELOG.md
+.DS_Store
+
+# Tests (assignment-specific)
+tests/
+
+# Root-level legacy training scripts
+run_*.sh
+submit_*.sh
+run_eval.pbs
+
+# Old scripts content
+scripts/alpaca_eval_vllm_llama3_3_70b_fn/
+scripts/evaluate_safety.py
+
+# Assignment PDFs
+cs336_spring2025_*.pdf
+
+# Submission script
+test_and_make_submission.sh
 
 nav
 tags
@@ -178,3 +214,4 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+data/math/train_filtered.jsonl

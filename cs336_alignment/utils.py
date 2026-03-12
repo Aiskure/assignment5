@@ -252,6 +252,7 @@ def compute_group_normalized_rewards(
     group_size,
     advantage_eps,
     normalize_by_std,
+    filter_zero_std_groups: bool = False,
 ):
     """
     为每个 rollout 响应计算原始奖励，并在组内进行归一化。
@@ -328,12 +329,21 @@ def compute_group_normalized_rewards(
     num_groups = raw_rewards.numel() // group_size
     grouped = raw_rewards.view(num_groups, group_size)
     group_mean = grouped.mean(dim=1, keepdim=True)
+    group_std = grouped.std(dim=1, keepdim=True, unbiased=True)
 
     if normalize_by_std:
-        group_std = grouped.std(dim=1, keepdim=True, unbiased=True) #要求样本标准差而不是总体样本差
         normalized_rewards = (grouped - group_mean) / (group_std + advantage_eps)
     else:
         normalized_rewards = grouped - group_mean
+
+    # 过滤全0或全1的 group（std ≈ 0，无梯度信号）
+    if filter_zero_std_groups:
+        zero_std_mask = (group_std.squeeze(1) < advantage_eps)  # (num_groups,)
+        zero_std_expanded = zero_std_mask.unsqueeze(1).expand_as(normalized_rewards)
+        normalized_rewards = normalized_rewards.masked_fill(zero_std_expanded, 0.0)
+        n_filtered = int(zero_std_mask.sum().item())
+    else:
+        n_filtered = 0
 
     normalized_rewards = normalized_rewards.reshape(-1)
     metadata = {
@@ -343,6 +353,7 @@ def compute_group_normalized_rewards(
         "reward_max": float(raw_rewards.max().item()),
         "num_groups": float(num_groups),
         "group_size": float(group_size),
+        "filtered_groups": float(n_filtered),
     }
     return normalized_rewards, raw_rewards, metadata
 
@@ -477,7 +488,8 @@ def compute_grpo_clip_loss(
 
     if not torch.isfinite(advantages).all():
         raise ValueError("advantages contains NaN/Inf.")
-    ratio = torch.exp(policy_log_probs - old_log_probs)
+    log_ratio = (policy_log_probs - old_log_probs).clamp(-20, 20)
+    ratio = torch.exp(log_ratio)
     clipped_ratio = torch.clamp(ratio,1-cliprange,1+cliprange)
 
     loss = -torch.minimum(advantages * ratio,advantages * clipped_ratio)
@@ -566,6 +578,8 @@ def grpo_microbatch_train_step(
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     loss_aggregation: Literal["masked_mean", "masked_normalize"] = "masked_normalize",
+    ref_log_probs: torch.Tensor | None = None,
+    kl_coef: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     #sanity check
     if policy_log_probs.ndim !=2:
@@ -601,11 +615,20 @@ def grpo_microbatch_train_step(
     if not torch.isfinite(masked_loss).all().item():
         raise ValueError("masked_loss contains NaN/Inf.")  
     
-    loss = masked_loss.mean() #变成一个数
-    loss = loss/gradient_accumulation_steps
+    loss = masked_loss.mean()
+
+    # KL-in-loss: low_var_kl (k3 estimator) = exp(log_ref - log_θ) - (log_ref - log_θ) - 1
+    if ref_log_probs is not None and kl_coef > 0.0:
+        log_diff = (ref_log_probs - policy_log_probs).clamp(-20, 20)
+        low_var_kl = torch.exp(log_diff) - log_diff - 1  # (B, T), always >= 0
+        kl_loss = masked_mean(low_var_kl, response_mask, dim=None)
+        loss = loss + kl_coef * kl_loss
+        loss_metadata["kl_loss"] = kl_loss.detach()
+
+    loss = loss / gradient_accumulation_steps
     if not torch.isfinite(loss).item():
         raise ValueError("final loss is NaN/Inf.")
-    
+
     loss.backward()
 
     metadata = dict(loss_metadata)
