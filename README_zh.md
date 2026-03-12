@@ -121,7 +121,7 @@ bash scripts/grpo.sh
 │   ├── grpo_train_loop.py # GRPO 训练循环
 │   ├── expert_iteration_experiment.py
 │   ├── utils.py           # 损失函数、奖励计算
-│   ├── math_baseline.py   # vLLM 评估
+│   ├── evaluate.py        # vLLM 评估
 │   └── drgrpo_grader.py   # 数学答案评分
 ├── scripts/               # 训练与评估脚本
 │   ├── sft.sh

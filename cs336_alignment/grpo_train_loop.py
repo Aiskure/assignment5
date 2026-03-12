@@ -25,7 +25,7 @@ from cs336_alignment.utils import (
 )
 
 # ---- NSCC PBS 兼容：UUID 格式的 CUDA_VISIBLE_DEVICES → 数字 index ----
-from cs336_alignment.math_baseline import _normalize_cuda_visible_devices_for_vllm
+from cs336_alignment.evaluate import _normalize_cuda_visible_devices_for_vllm
 _normalize_cuda_visible_devices_for_vllm()
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn

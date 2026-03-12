@@ -121,7 +121,7 @@ Key overrides:
 │   ├── grpo_train_loop.py # GRPO training loop
 │   ├── expert_iteration_experiment.py
 │   ├── utils.py           # Loss functions, reward computation
-│   ├── math_baseline.py   # Evaluation with vLLM
+│   ├── evaluate.py        # Evaluation with vLLM
 │   └── drgrpo_grader.py   # Math answer grading
 ├── scripts/               # Training & evaluation scripts
 │   ├── sft.sh

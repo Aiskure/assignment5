@@ -15,7 +15,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cs336_alignment import utils
-from cs336_alignment.math_baseline import evaluate
+from cs336_alignment.evaluate import evaluate
 
 try:
     import wandb

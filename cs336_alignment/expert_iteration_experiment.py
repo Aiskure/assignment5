@@ -29,7 +29,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # NSCC PBS 节点上 CUDA_VISIBLE_DEVICES 可能是 UUID 格式（"GPU-..."），
 # 需要在 vLLM 初始化前转换为数字索引，否则 vLLM 无法识别设备。
-from cs336_alignment.math_baseline import _normalize_cuda_visible_devices_for_vllm
+from cs336_alignment.evaluate import _normalize_cuda_visible_devices_for_vllm
 _normalize_cuda_visible_devices_for_vllm()
 
 from cs336_alignment import utils

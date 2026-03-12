@@ -26,7 +26,7 @@ from typing import Any
 import torch
 from tqdm import tqdm
 
-from cs336_alignment.math_baseline import _normalize_cuda_visible_devices_for_vllm
+from cs336_alignment.evaluate import _normalize_cuda_visible_devices_for_vllm
 _normalize_cuda_visible_devices_for_vllm()
 
 from cs336_alignment import utils

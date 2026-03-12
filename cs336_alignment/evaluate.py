@@ -84,7 +84,7 @@ Assistant: <think>"""
 def _require_vllm() -> None:
     if SamplingParams is None:
         raise ModuleNotFoundError(
-            "vllm is required for math_baseline evaluation. Install vllm before calling evaluate()."
+            "vllm is required for evaluation. Install vllm before calling evaluate()."
         )
 
 

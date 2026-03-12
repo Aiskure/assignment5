@@ -36,7 +36,7 @@ echo "[EVAL] dataset=$DATASET_PATH  max_samples=$MAX_EVAL_SAMPLES  strategy=$SAM
 echo "[EVAL] output=$OUTPUT_DIR"
 echo "========================================="
 
-uv run python -m cs336_alignment.math_baseline \
+uv run python -m cs336_alignment.evaluate \
     --model-path        "$ASSIGNMENT5_MODEL_ID" \
     --dataset-path      "$DATASET_PATH" \
     --max-eval-samples  "$MAX_EVAL_SAMPLES" \
