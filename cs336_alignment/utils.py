@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, TYPE_CHECKING
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, PreTrainedModel
@@ -209,6 +210,7 @@ def init_vllm(
     device: str,
     seed: int,
     gpu_memory_utilization: float = 0.85,
+    max_model_len: int = 4096,
 ) -> LLM:
     """
     启动推理进程，使用 vLLM 在单独的 GPU 上加载模型
@@ -240,6 +242,7 @@ def init_vllm(
             dtype=torch.bfloat16,      # 使用 bfloat16 节省显存
             enable_prefix_caching=True, # 启用前缀缓存加速生成
             gpu_memory_utilization=gpu_memory_utilization, # GPU内存使用率，默认0.85
+            max_model_len=max_model_len, # 限制最大序列长度，防止KV cache OOM
         )
  
 
@@ -637,3 +640,101 @@ def grpo_microbatch_train_step(
     return loss.detach(), metadata
 
 
+
+#========================================.RLHF.========================================
+
+#========================================.GSM8K.========================================
+def parse_gsm8k_response(model_output: str) -> str | None:
+    """取模型输出中最后一个数字作为预测答案，找不到返回 None。"""
+    if not model_output or not isinstance(model_output, str):
+        return None
+    matches = re.findall(r'-?\d[\d,\.]*', model_output)
+    if not matches:
+        return None
+    return matches[-1].replace(",", "").rstrip(".")
+
+
+#========================================.MMLU.========================================
+def parse_mmlu_response(mmlu_example: dict, model_output: str) -> str | None:
+    """
+    从模型的自由文本输出中提取答案字母 A/B/C/D
+    
+    成功解析 → 返回 "A"/"B"/"C"/"D"
+    无法解析 → 返回 None
+    """
+    if not model_output or not isinstance(model_output, str):
+        return None
+        
+    # 加入 re.IGNORECASE 来兼容小写的 a, b, c, d
+    match = re.search(r'\b([ABCD])\b', model_output, re.IGNORECASE)
+    
+    if match:
+        # group(1).upper() 会把匹配到的小写字母也转换成大写，方便后续和 gold_answer 对比
+        return match.group(1).upper()
+        
+    return None
+
+
+
+#========================================.DPO.========================================
+
+ALPACA_TEMPLATE = (
+    "Below is an instruction that describes a task. "
+    "Write a response that appropriately completes the request.\n\n"
+    "### Instruction:\n{instruction}\n\n### Response:\n{response}"
+)
+
+
+def compute_per_instance_dpo_loss(
+    lm: torch.nn.Module,
+    lm_ref: torch.nn.Module,
+    tokenizer,
+    beta: float,
+    prompt: str,
+    response_chosen: str,
+    response_rejected: str,
+    max_length: int = 512,
+) -> torch.Tensor:
+    """
+    计算单条样本的 DPO loss。
+
+    DPO loss = -log σ( β * [ (log π_θ(y_w|x) - log π_θ(y_l|x))
+                            - (log π_ref(y_w|x) - log π_ref(y_l|x)) ] )
+
+    简化：log π(y|x) 可以用 log π(x⊕y) 的差来代替，因为 prompt 部分抵消。
+    """
+    # Step 1: 用 Alpaca template 拼接完整字符串，末尾加 EOS
+    chosen_text = ALPACA_TEMPLATE.format(instruction=prompt, response=response_chosen) + tokenizer.eos_token
+    rejected_text = ALPACA_TEMPLATE.format(instruction=prompt, response=response_rejected) + tokenizer.eos_token
+
+    # Step 2: Tokenize（显式截断，防止长样本 OOM）
+    chosen_ids = tokenizer(chosen_text, return_tensors="pt", truncation=True, max_length=max_length).input_ids
+    rejected_ids = tokenizer(rejected_text, return_tensors="pt", truncation=True, max_length=max_length).input_ids
+
+    # Step 3: 算 log-prob（对 lm 和 lm_ref 各算 chosen 和 rejected，共 4 次 forward）
+    chosen_input = chosen_ids[:, :-1]
+    chosen_labels = chosen_ids[:, 1:]
+    rejected_input = rejected_ids[:, :-1]
+    rejected_labels = rejected_ids[:, 1:]
+
+    lm_device = next(lm.parameters()).device
+    ref_device = next(lm_ref.parameters()).device
+
+    lm_chosen_logprobs = get_response_log_probs(lm, chosen_input.to(lm_device), chosen_labels.to(lm_device))["log_probs"]
+    lm_rejected_logprobs = get_response_log_probs(lm, rejected_input.to(lm_device), rejected_labels.to(lm_device))["log_probs"]
+
+    with torch.no_grad():
+        ref_chosen_logprobs = get_response_log_probs(lm_ref, chosen_input.to(ref_device), chosen_labels.to(ref_device))["log_probs"]
+        ref_rejected_logprobs = get_response_log_probs(lm_ref, rejected_input.to(ref_device), rejected_labels.to(ref_device))["log_probs"]
+
+    # Step 4: 每个序列的 log-prob 求和得到标量
+    lm_chosen_logprob = lm_chosen_logprobs.sum()
+    lm_rejected_logprob = lm_rejected_logprobs.sum()
+    ref_chosen_logprob = ref_chosen_logprobs.sum().to(lm_device)
+    ref_rejected_logprob = ref_rejected_logprobs.sum().to(lm_device)
+
+    # Step 5: 代入 DPO 公式
+    loss = -torch.nn.functional.logsigmoid(
+        beta * ((lm_chosen_logprob - lm_rejected_logprob) - (ref_chosen_logprob - ref_rejected_logprob))
+    )
+    return loss

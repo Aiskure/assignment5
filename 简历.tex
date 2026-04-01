@@ -1,0 +1,96 @@
+%% !TEX program = xelatex
+%% Copyright (c) 2018-2020 Weitian LI <wt@liwt.net>
+%% CC BY 4.0 License
+%%
+%% Created: 2018-04-11
+%%
+
+% Chinese version
+\documentclass[zh]{resume}
+
+\fileinfo{}
+
+\name{狄璇}{杨}
+
+\keywords{大模型, 算法工程师, 模型压缩, 模型微调, PyTorch, DeepSpeed}
+
+% \tagline{\texorpdfstring{\icon{\faBinoculars} }{}<position-to-look-for>}
+% \tagline{<current-position>}
+
+% \photo[
+%   shape=<circular|square>,    % default is circular
+%   position=<left|right>,      % default is left
+% ]{<width>}{<filename>}
+% Example:
+% \photo[shape=square]{5.5em}{photo}
+
+\profile{
+  \mobile{182-7453-7589}
+  \email{y762523583@gmail.com}
+  % Custom information:
+  % \icontext{<icon>}{<text>}
+  % \iconlink{<icon>}{<link>}{<text>}
+}
+
+\begin{document}
+\makeheader
+
+%======================================================================
+\sectionTitle{教育背景}{\faGraduationCap}
+%======================================================================
+\begin{educations}
+  \education%
+    {2025.08}%
+    [2026.12]%
+    {新加坡国立大学}%
+    {理学院}%
+    {AI for Science}%
+    {硕士}
+  \separator{0.5ex}
+  \education%
+    {2021.09}%
+    [2025.06]%
+    {中山大学}%
+    {大气科学学院}%
+    {大气科学}%
+    {学士}
+\end{educations}
+
+%======================================================================
+\sectionTitle{项目经历}{\faCode}
+%======================================================================
+\begin{itemize}
+    \item \textbf{基于 DPO 的大模型指令对齐与安全性评估}（NSCC 4×A100 集群） \hfill 2026.01 --- 2026.03
+    \begin{itemize}
+        \item \textbf{项目背景}: Llama-3.1-8B base model 无法遵循指令格式，零样本评测下 MMLU/GSM8K 准确率均为 0\%（输出退化为无意义 token 循环），且无安全拒绝能力。目标是通过 SFT + DPO 两阶段对齐，建立指令遵循能力与安全护栏，并量化每阶段的对齐收益与对齐税。
+        \item \textbf{SFT 阶段}: 基于 QLoRA（r=64, alpha=128）对 Llama-3.1-8B 进行参数高效指令微调，在 UltraChat-200K 安全增强数据集上训练；解决 bitsandbytes 4-bit 量化权重与 vLLM 推理框架的兼容性问题——实现 LoRA adapter merge 工具（base bf16 + adapter → full-precision 模型），打通训练到部署的完整链路
+        \item \textbf{DPO 阶段}: 基于 Anthropic HH-RLHF 偏好数据实现 DPO 训练，设计双卡部署架构将可训练策略 $\pi_{\theta}$ 与冻结参考模型 $\pi_{\mathrm{ref}}$ 分卡放置以规避显存竞争；通过隐式奖励（策略与参考模型的对数概率比）直接优化人类偏好，无需显式奖励模型；针对无 adapter 的 4-bit 量化 checkpoint，实现 \texttt{dequantize()} 转换流程（4-bit → fp32）保证推理兼容
+        \item \textbf{四维评测体系}: 搭建 MMLU / GSM8K / AlpacaEval / SimpleSafetyTests 评测流水线，其中 AlpacaEval 与 SST 使用 Llama-3.3-70B-Instruct 作为 judge（4 卡 tensor parallel）；对 base → SFT → DPO 逐阶段评测，并进行定性错误分析——发现 MMLU 上严重的 position bias（错误预测中 90\% 选 A）、SST 按 5 个危害类别拆解发现 Child Abuse 安全率仅 5\%
+        \item \textbf{实验结果}: SFT 后 MMLU 从 0\% → \textbf{22.82\%}，推理吞吐量提升 2.8×；DPO 后安全性 36\% → \textbf{42\%}（Child Abuse 类别 5\% → 25\%），AlpacaEval LC win rate 1.28\%（SFT）/ 0.92\%（DPO）；MMLU/GSM8K 对齐税可忽略（−0.64\% / +0.22\%），验证 DPO 在不损害通用能力的前提下可有效提升安全对齐
+        \item \textbf{技术栈}: Python · PyTorch · vLLM · QLoRA · bitsandbytes · HuggingFace Transformers · flash-attn
+    \end{itemize}
+    \item \textbf{基于 GRPO 的数学推理模型对齐训练系统}（NSCC 4×A100 集群） \hfill 2025.11 --- 2026.01
+    \begin{itemize}
+        \item \textbf{项目背景}: Qwen2.5-Math-1.5B 预训练模型在 MATH 数据集上准确率仅 4.1\%，输出格式不可控、推理链质量低，无法用于结构化数学推理场景。系统性对比 SFT / Expert Iteration / GRPO 三条对齐路线，寻找最优方案。
+        \item \textbf{数据与评测工程}: 对 MATH 数据集重新划分（12500 → 7500 train / 5000 val），设计可复现的 seeded random 评测抽样；实现基于正则表达式的数学答案评分器，支持 \texttt{<think>/<answer>} 格式解析与数值等价性判断（非简单字符串匹配）；训练过程中集成 vLLM 周期性评估（每 N 步自动 rollout → 评分），实现训练—评估一体化流水线
+        \item \textbf{SFT 基线}: 实现微批次训练（response mask + shifted labels + 梯度累积），在 5 个数据规模下验证 data scaling law，准确率从 4.1\% → 18.9\%
+        \item \textbf{Expert Iteration}: 实现 vLLM rollout → rejection sampling → SFT 迭代闭环，设计 6 组控制变量实验覆盖 rollout 数 / 回放缓冲区大小 / SFT 轮数，准确率达 21.9\%
+        \item \textbf{GRPO（核心）}: 从零实现完整训练循环——rollout 采样 → group-relative advantage 归一化 → PPO-clip 损失 → 梯度累积，支持 on-policy / off-policy 切换；引入 log-ratio clamp 防止 off-policy 数值爆炸；完成 12 组控制变量实验（5 组学习率扫描 + baseline 消除 + masked normalize + off-policy epoch 等消融），系统验证各设计选择对对齐效果的独立影响
+        \item \textbf{最终效果}: 三条路线从同一 base model 出发：SFT 18.9\% → EI 21.9\% → GRPO \textbf{46.1\%}（11 倍提升）；使用 W\&B 管理 18 组实验的超参对比与训练曲线可视化
+        \item \textbf{技术栈}: Python · PyTorch · vLLM · HuggingFace Transformers · flash-attn · W\&B
+    \end{itemize}
+
+\end{itemize}
+
+%======================================================================
+\sectionTitle{专业技能}{\faWrench}
+%======================================================================
+\begin{itemize}
+    \item 熟悉 Python 及 PyTorch 框架，掌握 Hugging Face Transformers 等大模型开发工具。
+    \item 深入理解大模型微调技术，如 P-tuning、LoRA 等，并有丰富的提示工程实践经验。
+    \item 熟悉 LLaMA 等主流模型架构，以及 RLHF、DPO 等偏好对齐方法。
+    \item 熟悉 DeepSpeed 等分布式训练框架，具备大模型训练与部署性能优化能力。
+    \item 了解 RAG、Agent 等 LLM 应用技术，对多模态大模型有研究与实践经验。
+\end{itemize}
+
+\end{document}
